@@ -2,15 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-PIM SKU Attribute Fetcher (Streamlit) — with Connection Mode
+PIM SKU Attribute Fetcher (Streamlit) — with Proxy Auto-Detect (PAC), progress, and diagnostics.
 
-Paste a PIM URL up to and including attribute_codes=... (no `skus`),
-the app appends &skus=... as repeated params, with batching and progress UI.
+Modes:
+- Auto (PAC/WPAD): detect and use system PAC like the browser does
+- Direct (ignore proxies): bypass all proxies (for full-tunnel VPN)
+- Env (HTTP(S)_PROXY): use proxy URLs from environment variables
 
-New:
-- Connection Mode: Auto (default), Direct (ignore proxies), Proxy (use env)
-- Strong timeouts, diagnostics, host allow-list, masked URL
-- Python 3.9-friendly typing
+Features:
+- Paste URL up to attribute_codes=...; app appends &skus=... (repeated), batched
+- 6-digit zero-padding for numeric SKUs
+- Strong timeouts (no hangs), retries with backoff
+- Live progress, ETA, per-batch logs, toasts
+- Connectivity check (DNS, HTTP via chosen mode)
 """
 
 import io
@@ -26,10 +30,16 @@ import httpx
 import pandas as pd
 import streamlit as st
 
-# =========================
-# Config / Security
-# =========================
+# PAC support
+try:
+    from pypac import get_pac
+    HAVE_PYPAC = True
+except Exception:
+    HAVE_PYPAC = False
 
+# =========================
+# Config
+# =========================
 ALLOWED_SUFFIXES = (".hbi.systems",)
 DEFAULT_CHUNK_SIZE = 900
 HTTPX_TIMEOUTS = httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=60.0)
@@ -45,39 +55,6 @@ def auth_headers() -> Dict[str, str]:
         headers["Authorization"] = f"Bearer {token}"
     return headers
 
-def get_client(connection_mode: str) -> httpx.Client:
-    """
-    Build an httpx client according to the chosen connection mode:
-
-    - Auto: trust_env=True (honors HTTP(S)_PROXY/NO_PROXY if present)
-    - Direct: trust_env=False and proxies=None (ignore all proxies)
-    - Proxy: trust_env=False, proxies taken explicitly from env
-    """
-    headers = auth_headers()
-    verify: Any = True
-    if os.getenv("PIM_INSECURE_TLS") == "1":  # only for internal/self-signed testing
-        verify = False
-
-    if connection_mode == "Direct (ignore proxies)":
-        # ignore proxies completely
-        return httpx.Client(timeout=HTTPX_TIMEOUTS, headers=headers, verify=verify, trust_env=False)
-
-    if connection_mode == "Proxy (use env)":
-        proxies_env = {}
-        if os.getenv("HTTP_PROXY"):
-            proxies_env["http://"] = os.getenv("HTTP_PROXY")
-        if os.getenv("HTTPS_PROXY"):
-            proxies_env["https://"] = os.getenv("HTTPS_PROXY")
-        # NO_PROXY is ignored in this forced-proxy mode; the proxy must route internal traffic
-        return httpx.Client(timeout=HTTPX_TIMEOUTS, headers=headers, verify=verify, trust_env=False, proxies=proxies_env or None)
-
-    # Auto (default): honor OS/env (HTTP(S)_PROXY + NO_PROXY) via trust_env=True
-    return httpx.Client(timeout=HTTPX_TIMEOUTS, headers=headers, verify=verify, trust_env=True)
-
-def chunked(items: List[str], size: int) -> Iterable[List[str]]:
-    for i in range(0, len(items), size):
-        yield items[i : i + size]
-
 def clean_skus(raw: str) -> List[str]:
     if not raw:
         return []
@@ -92,6 +69,10 @@ def clean_skus(raw: str) -> List[str]:
 
 def pad_sku(s: str, width: int = 6) -> str:
     return s.zfill(width) if s.isdigit() and len(s) < width else s
+
+def chunked(items: List[str], size: int) -> Iterable[List[str]]:
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
 
 def normalize_response(payload: Dict[str, Any]) -> pd.DataFrame:
     if not payload:
@@ -145,7 +126,7 @@ def parse_user_url(user_url: str) -> Tuple[str, Dict[str, List[str]]]:
     u = urlparse(user_url)
     host = u.hostname or ""
     if not any(host.endswith(suf) for suf in ALLOWED_SUFFIXES):
-        raise ValueError("Unapproved host. Use an internal *.hbi.systems URL (and ensure VPN).")
+        raise ValueError("Unapproved host. Use an internal *.hbi.systems URL (ensure VPN).")
 
     q_items = parse_qsl(u.query, keep_blank_values=True)
     params: Dict[str, List[str]] = {}
@@ -169,6 +150,83 @@ def build_params_with_skus(params_base: Dict[str, List[str]], skus: List[str]) -
 def backoff_sleep(attempt: int, base: float = 0.5, cap: float = 20.0):
     delay = min(cap, base * (2 ** attempt)) + (0.1 * (attempt + 1))
     time.sleep(delay)
+
+# -------- Proxy handling (PAC / env / direct) --------
+
+def _parse_pac_result(pac_str: str) -> Optional[str]:
+    """
+    Takes a PAC directive string like "PROXY proxy.mycorp:8080; DIRECT"
+    Returns a proxy URL string "http://proxy.mycorp:8080" or None for DIRECT.
+    """
+    if not pac_str:
+        return None
+    parts = [p.strip() for p in pac_str.split(";") if p.strip()]
+    for p in parts:
+        p_up = p.upper()
+        if p_up.startswith("PROXY "):
+            hostport = p.split(" ", 1)[1].strip()
+            if not hostport.startswith("http://") and not hostport.startswith("https://"):
+                return f"http://{hostport}"
+            return hostport
+        if p_up.startswith("HTTPS "):  # rare, but handle
+            hostport = p.split(" ", 1)[1].strip()
+            if not hostport.startswith("http"):
+                return f"https://{hostport}"
+            return hostport
+        if p_up.startswith("DIRECT"):
+            return None
+    return None
+
+def resolve_proxies_for_url(url: str, mode: str) -> Tuple[Dict[str, str], bool]:
+    """
+    Returns (proxies_dict, trust_env_flag).
+    - Auto (PAC/WPAD): use PAC if available; else honor env via trust_env=True
+    - Direct: no proxies, trust_env=False
+    - Env: proxies from HTTP(S)_PROXY, trust_env=False
+    """
+    if mode == "Direct (ignore proxies)":
+        return ({}, False)
+
+    if mode == "Env (HTTP(S)_PROXY)":
+        proxies: Dict[str, str] = {}
+        if os.getenv("HTTP_PROXY"):
+            proxies["http://"] = os.getenv("HTTP_PROXY")
+        if os.getenv("HTTPS_PROXY"):
+            proxies["https://"] = os.getenv("HTTPS_PROXY")
+        return (proxies, False)
+
+    # Auto (PAC/WPAD)
+    if HAVE_PYPAC:
+        try:
+            pac = get_pac()  # from env/wpad/registry if available
+            if pac:
+                u = urlparse(url)
+                pac_str = pac.find_proxy_for_url(url, u.hostname or "")
+                proxy_url = _parse_pac_result(pac_str)
+                if proxy_url:
+                    # Use same proxy for http and https; PAC typically returns one
+                    return ({"http://": proxy_url, "https://": proxy_url}, False)
+                else:
+                    # DIRECT
+                    return ({}, False)
+        except Exception:
+            pass
+    # Fallback: honor env automatically
+    return ({}, True)
+
+def get_client_for_url(url: str, mode: str) -> httpx.Client:
+    headers = auth_headers()
+    verify: Any = True
+    if os.getenv("PIM_INSECURE_TLS") == "1":  # internal testing only
+        verify = False
+
+    proxies, trust_env = resolve_proxies_for_url(url, mode)
+    if proxies:
+        return httpx.Client(timeout=HTTPX_TIMEOUTS, headers=headers, verify=verify, trust_env=trust_env, proxies=proxies)
+    else:
+        return httpx.Client(timeout=HTTPX_TIMEOUTS, headers=headers, verify=verify, trust_env=trust_env)
+
+# -------- HTTP --------
 
 def fetch_batch(
     client: httpx.Client,
@@ -208,7 +266,7 @@ def fetch_batch(
             backoff_sleep(attempt)
             attempt += 1
 
-def diagnose_connectivity(user_url: str, pad_to_six_flag: bool, sample_sku: str, connection_mode: str) -> Dict[str, Any]:
+def diagnose_connectivity(user_url: str, pad_to_six_flag: bool, sample_sku: str, mode: str) -> Dict[str, Any]:
     results: Dict[str, Any] = {}
     try:
         u = urlparse(user_url)
@@ -221,25 +279,20 @@ def diagnose_connectivity(user_url: str, pad_to_six_flag: bool, sample_sku: str,
     except Exception as e:
         results["dns_error"] = str(e)
         return results
-    try:
-        t0 = time.time()
-        with socket.create_connection((results["host"], 443), timeout=5):
-            pass
-        results["tcp443_ms"] = int((time.time() - t0) * 1000)
-    except Exception as e:
-        results["tcp_error"] = str(e)
-        return results
+
+    # HTTP probe via chosen mode (TCP direct test is meaningless if proxy is required)
     try:
         base_no_query, params_base = parse_user_url(user_url)
         sku = pad_sku(sample_sku) if pad_to_six_flag else sample_sku
         params = build_params_with_skus(params_base, [sku])
-        with get_client(connection_mode) as c:
+        with get_client_for_url(base_no_query, mode) as c:
             t0 = time.time()
             r = c.get(base_no_query, params=params, timeout=HTTPX_TIMEOUTS)
             results["probe_status"] = r.status_code
             results["probe_ms"] = int((time.time() - t0) * 1000)
     except Exception as e:
         results["probe_error"] = str(e)
+
     return results
 
 # =========================
@@ -255,21 +308,18 @@ with st.expander("Connection, Auth & Safety", expanded=False):
 - The app appends `&skus=` as **repeated params** in batches (default 900).
 - **Auth**: set `PIM_TOKEN` as an environment variable if required by the API.
 - **Network**: use VPN or run on an on-net host. Host allow-list enforced.
-- **Privacy**: URL is masked; caching of responses is disabled by default.
+- **Proxy**: choose a connection mode below. If browser works but Python doesn’t, try **Auto (PAC/WPAD)**.
     """)
 
-# Connection mode
 connection_mode = st.radio(
     "Connection mode",
-    options=["Auto (honor env)", "Direct (ignore proxies)", "Proxy (use env)"],
+    options=["Auto (PAC/WPAD)", "Direct (ignore proxies)", "Env (HTTP(S)_PROXY)"],
     index=0,
-    help="If stuck at 'Prepared 1 batch', try 'Direct (ignore proxies)' on VPN; or 'Proxy (use env)' if your org requires proxy for internal."
 )
 
-# URL
 st.subheader("Endpoint (paste up to attribute_codes; no SKUs)")
 user_url = st.text_input(
-    "Internal PIM URL (kept in memory only)",
+    "Internal PIM URL",
     value="",
     placeholder="https://.../v4/description/skus?attribute_codes=returnable",
     type="password",
@@ -278,10 +328,9 @@ show_url = st.checkbox("Temporarily reveal URL", value=False)
 if show_url and user_url:
     st.code(user_url)
 
-# SKUs
 st.subheader("SKUs")
 sku_text = st.text_area(
-    "Paste SKUs (any delimiter: newline, comma, semicolon, tab)",
+    "Paste SKUs (newline/comma/semicolon/tab)",
     height=160,
     placeholder="064037\n123456\n42\nABC123",
 )
@@ -310,17 +359,15 @@ if uploaded:
     except Exception as e:
         st.error(f"Failed to read CSV: {e}")
 
-# Options
 colA, colB, colC = st.columns([1, 1, 1])
 with colA:
     pad_to_six = st.toggle("Pad numeric SKUs to 6 chars (000042)", value=True)
 with colB:
     chunk_size = st.number_input("Batch size (max SKUs per request)", value=DEFAULT_CHUNK_SIZE, min_value=50, max_value=2000, step=50)
 with colC:
-    disable_cache = st.toggle("Disable response caching (recommended)", value=True)
-save_raw = st.toggle("Enable raw JSONL download (responses)", value=False)
+    save_raw = st.toggle("Enable raw JSONL download (responses)", value=False)
 
-# Diagnostics / env
+# Diagnostics
 diag_cols = st.columns([1, 1])
 with diag_cols[0]:
     diag_btn = st.button("Run connectivity check")
@@ -332,22 +379,21 @@ with diag_cols[1]:
             f"NO_PROXY={os.getenv('NO_PROXY')}\n"
             f"SSL_CERT_FILE={os.getenv('SSL_CERT_FILE')}\n"
             f"REQUESTS_CA_BUNDLE={os.getenv('REQUESTS_CA_BUNDLE')}\n"
-            f"PIM_INSECURE_TLS={os.getenv('PIM_INSECURE_TLS')}"
+            f"PIM_INSECURE_TLS={os.getenv('PIM_INSECURE_TLS')}\n"
+            f"HAVE_PYPAC={HAVE_PYPAC}"
         )
-        st.caption("If traffic should stay internal, ensure NO_PROXY includes .hbi.systems (for Direct/Auto modes).")
+        st.caption("Auto (PAC/WPAD) requires pypac; browsers usually use PAC automatically.")
 
 if diag_btn and user_url:
-    with st.spinner("Diagnosing connectivity..."):
-        diag = diagnose_connectivity(user_url, pad_to_six_flag=pad_to_six, sample_sku="42", connection_mode=connection_mode)
+    with st.spinner("Diagnosing connectivity via selected mode..."):
+        diag = diagnose_connectivity(user_url, pad_to_six_flag=pad_to_six, sample_sku="42", mode=connection_mode)
     st.write(diag)
     if "dns_error" in diag:
-        st.error("DNS failed — check VPN / host name.")
-    elif "tcp_error" in diag:
-        st.error("TCP connect to port 443 failed — firewall/VPN/proxy issue.")
+        st.error("DNS failed — check VPN / hostname.")
     elif "probe_error" in diag:
         st.warning(f"HTTP probe failed: {diag['probe_error']}")
     else:
-        st.success(f"Reachable. HTTP status: {diag.get('probe_status')} in {diag.get('probe_ms')} ms")
+        st.success(f"HTTP reachable via {connection_mode}. Status: {diag.get('probe_status')} in {diag.get('probe_ms')} ms")
 
 # Preflight
 if user_url and skus:
@@ -363,7 +409,6 @@ if user_url and skus:
 
 # Run
 run_btn = st.button("Run fetch", type="primary", disabled=not (user_url and skus))
-
 if run_btn:
     try:
         base_no_query, params_base = parse_user_url(user_url)
@@ -372,7 +417,7 @@ if run_btn:
         batches = list(chunked(skus, int(chunk_size)))
         total_batches = len(batches)
 
-        client = get_client(connection_mode)
+        client = get_client_for_url(base_no_query, connection_mode)
 
         compiled_frames: List[pd.DataFrame] = []
         raw_lines: List[Dict[str, Any]] = []
@@ -417,7 +462,7 @@ if run_btn:
                 compiled_frames.append(df)
                 rows = len(df)
 
-            if save_raw and not disable_cache:
+            if save_raw:
                 raw_lines.append({"batch_index": i, "batch_size": len(batch), "skus": batch, "response": payload})
 
             prog.progress(i / total_batches)
