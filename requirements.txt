@@ -1,8 +1,12 @@
-# Streamlit app dependencies
 streamlit>=1.36
 pandas>=2.2
 httpx>=0.27
 
-# Optional but recommended for Parquet downloads
+# Optional but recommended (for Parquet download)
 pyarrow>=17.0.0
+
+# Proxy/PAC support (browser-like behavior)
 pypac>=0.16
+
+# NTLM/Integrated proxy auth (only needed if your proxy requires it)
+httpx-ntlm>=1.4
