@@ -2,50 +2,45 @@
 # -*- coding: utf-8 -*-
 
 """
-Streamlit app: Paste an internal PIM URL up to & including attribute_codes=...,
-then the app appends &skus=... (repeated params) in safe batches and compiles results.
+PIM SKU Attribute Fetcher (Streamlit)
 
-Visibility:
-- Progress bar + running ETA
-- Status feed (success/retry per batch)
-- Live per-batch log table (rows, retries, time)
-- Preflight panel to preview request counts and max query length
+Paste an internal PIM URL up to and including attribute_codes=... (no `skus`),
+then the app appends &skus=... as repeated params, in safe batches.
 
-Security & Ops:
-- URL input is masked (password field)
-- Host allow-listed (default: *.hbi.systems)
-- Bearer token read from env var PIM_TOKEN (optional)
-- Response caching disabled by default (toggleable)
-- Raw JSON download is opt-in
+Includes:
+- Progress bar, status feed, ETA, per-batch log
+- Strong timeouts (no indefinite hangs)
+- Connectivity diagnostics (DNS/TCP/HTTP probe)
+- Host allow-list, masked URL input, optional raw JSONL download
 
 Requirements:
-    streamlit>=1.36
-    pandas>=2.2
-    httpx>=0.27
-    pyarrow>=17 (optional, for Parquet download)
+  streamlit>=1.36
+  pandas>=2.2
+  httpx>=0.27
+  pyarrow>=17 (optional, for Parquet download)
 """
 
 import io
 import json
 import os
+import socket
 import time
 from time import perf_counter
-from typing import Any, Dict, Iterable, List, Tuple
-from urllib.parse import urlparse, parse_qsl, urlunparse, urlencode
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 import pandas as pd
 import streamlit as st
-
-from typing import Any, Dict, Iterable, List, Tuple, Callable, Optional
-
 
 # =========================
 # Config / Security
 # =========================
 
 ALLOWED_SUFFIXES = (".hbi.systems",)  # tighten/extend as needed
-DEFAULT_CHUNK_SIZE = 900              # keeps URLs under typical 414 limits
+DEFAULT_CHUNK_SIZE = 900              # helps avoid 414 URI too long
+# Hard timeouts so nothing can hang indefinitely
+HTTPX_TIMEOUTS = httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=60.0)
 
 # =========================
 # Helpers
@@ -58,10 +53,10 @@ def auth_headers() -> Dict[str, str]:
         headers["Authorization"] = f"Bearer {token}"
     return headers
 
-def get_client(timeout_s: int = 60) -> httpx.Client:
+def get_client() -> httpx.Client:
     """
-    Create an httpx client; only pass 'proxies' if they’re explicitly set to
-    avoid version mismatches. TLS verification remains ON by default.
+    Create an httpx client; only pass 'proxies' if explicitly set to avoid
+    version/arg mismatches. TLS verification ON by default (can be disabled via env).
     """
     proxies_env = {
         "http://": os.getenv("HTTP_PROXY"),
@@ -69,20 +64,21 @@ def get_client(timeout_s: int = 60) -> httpx.Client:
     }
     proxies_env = {k: v for k, v in proxies_env.items() if v}
 
-    kwargs = dict(timeout=timeout_s, headers=auth_headers())
+    kwargs: Dict[str, Any] = dict(timeout=HTTPX_TIMEOUTS, headers=auth_headers())
     if proxies_env:
-        kwargs["proxies"] = proxies_env  # httpx will honor NO_PROXY if set
+        kwargs["proxies"] = proxies_env  # httpx will honor NO_PROXY automatically
+
+    if os.getenv("PIM_INSECURE_TLS") == "1":  # only for internal/self-signed debugging
+        kwargs["verify"] = False
 
     return httpx.Client(**kwargs)
 
 def chunked(items: List[str], size: int) -> Iterable[List[str]]:
     for i in range(0, len(items), size):
-        yield items[i : i + size]
+        yield items[i: i + size]
 
 def clean_skus(raw: str) -> List[str]:
-    """
-    Accept newline/comma/semicolon/tab separated SKUs, trim, de-dup (keep order).
-    """
+    """Accept newline/comma/semicolon/tab separated SKUs, trim, de-dup (keep order)."""
     if not raw:
         return []
     raw = raw.replace(";", "\n").replace(",", "\n").replace("\t", "\n")
@@ -105,7 +101,7 @@ def normalize_response(payload: Dict[str, Any]) -> pd.DataFrame:
       1) {"data":[{"sku":"...","attributes":{"code":"val",...}}, ...]}
       2) {"data":[{"sku":"...","attribute_code":"...","value":...}, ...]}  (long-form)
       3) {"skus":{"SKU1":{"code":"val",...},"SKU2":{...}}}
-      4) other list/dict -> json_normalize
+      4) list/dict -> json_normalize
     """
     if not payload:
         return pd.DataFrame()
@@ -193,14 +189,14 @@ def parse_user_url(user_url: str) -> Tuple[str, Dict[str, List[str]]]:
 def build_params_with_skus(params_base: Dict[str, List[str]], skus: List[str]) -> Dict[str, List[str]]:
     """
     Clone base params and append SKUs as repeated keys (&skus=A&skus=B...).
-    httpx will encode list values as repeated query params when doseq=True internally.
+    httpx will encode list values as repeated query params.
     """
     params = {k: list(v) for k, v in params_base.items()}
     params["skus"] = skus
     return params
 
 def backoff_sleep(attempt: int, base: float = 0.5, cap: float = 20.0):
-    """Exponential backoff with a small additive nudge."""
+    """Exponential backoff with small additive increment."""
     delay = min(cap, base * (2 ** attempt)) + (0.1 * (attempt + 1))
     time.sleep(delay)
 
@@ -211,11 +207,25 @@ def fetch_batch(
     max_retries: int = 6,
     on_retry: Optional[Callable[[int, Any], None]] = None,  # (attempt_index, http_status_or_exc) -> None
 ) -> Tuple[Dict[str, Any], int, float]:
+    """
+    Returns: (payload, attempts (retries used), duration_seconds)
+    - attempts = number of retry attempts actually taken (0 if first try succeeded)
+    - duration_seconds = end-to-end time for this batch
+    """
     attempt = 0
     start = perf_counter()
+
+    # One-off "starting" signal to the UI
+    if on_retry:
+        try:
+            qs_len = len(httpx.QueryParams(params))
+            on_retry(0, f"start(len_qs={qs_len})")
+        except Exception:
+            pass
+
     while True:
         try:
-            resp = client.get(base_url, params=params)
+            resp = client.get(base_url, params=params, timeout=HTTPX_TIMEOUTS)
             if resp.status_code in (429, 500, 502, 503, 504):
                 if attempt >= max_retries:
                     resp.raise_for_status()
@@ -234,6 +244,51 @@ def fetch_batch(
             backoff_sleep(attempt)
             attempt += 1
 
+def diagnose_connectivity(user_url: str, pad_to_six_flag: bool, sample_sku: str = "42") -> Dict[str, Any]:
+    """
+    Runs DNS, TCP:443, and a tiny HTTP GET (with a single SKU) to spot where it hangs.
+    Returns a dict of results for display.
+    """
+    results: Dict[str, Any] = {}
+    try:
+        u = urlparse(user_url)
+        host = u.hostname or ""
+        results["host"] = host
+
+        # DNS
+        t0 = time.time()
+        ip = socket.gethostbyname(host)
+        results["dns_ip"] = ip
+        results["dns_ms"] = int((time.time() - t0) * 1000)
+    except Exception as e:
+        results["dns_error"] = str(e)
+        return results
+
+    # TCP connect
+    try:
+        t0 = time.time()
+        with socket.create_connection((results["host"], 443), timeout=5):
+            pass
+        results["tcp443_ms"] = int((time.time() - t0) * 1000)
+    except Exception as e:
+        results["tcp_error"] = str(e)
+        return results
+
+    # Tiny HTTP probe
+    try:
+        base_no_query, params_base = parse_user_url(user_url)
+        sku = pad_sku(sample_sku) if pad_to_six_flag else sample_sku
+        params = build_params_with_skus(params_base, [sku])
+
+        with get_client() as c:
+            t0 = time.time()
+            r = c.get(base_no_query, params=params, timeout=HTTPX_TIMEOUTS)
+            results["probe_status"] = r.status_code
+            results["probe_ms"] = int((time.time() - t0) * 1000)
+    except Exception as e:
+        results["probe_error"] = str(e)
+
+    return results
 
 # =========================
 # Streamlit UI
@@ -317,21 +372,55 @@ if uploaded:
         st.error(f"Failed to read CSV: {e}")
 
 # -------------------------
+# Diagnostics & Environment
+# -------------------------
+diag_cols = st.columns([1, 1])
+with diag_cols[0]:
+    diag_btn = st.button("Run connectivity check")
+with diag_cols[1]:
+    env_expander = st.expander("Environment (proxy/certs)", expanded=False)
+    with env_expander:
+        st.code(
+            f"HTTP_PROXY={os.getenv('HTTP_PROXY')}\n"
+            f"HTTPS_PROXY={os.getenv('HTTPS_PROXY')}\n"
+            f"NO_PROXY={os.getenv('NO_PROXY')}\n"
+            f"SSL_CERT_FILE={os.getenv('SSL_CERT_FILE')}\n"
+            f"REQUESTS_CA_BUNDLE={os.getenv('REQUESTS_CA_BUNDLE')}\n"
+            f"PIM_INSECURE_TLS={os.getenv('PIM_INSECURE_TLS')}"
+        )
+        st.caption("If traffic should stay internal, ensure NO_PROXY includes .hbi.systems")
+
+if diag_btn and user_url:
+    with st.spinner("Diagnosing connectivity..."):
+        diag = diagnose_connectivity(user_url, pad_to_six_flag=pad_to_six)
+    st.write(diag)
+    if "dns_error" in diag:
+        st.error("DNS failed — check VPN / host name.")
+    elif "tcp_error" in diag:
+        st.error("TCP connect to port 443 failed — firewall/VPN/proxy issue.")
+    elif "probe_error" in diag:
+        st.warning(f"HTTP probe failed: {diag['probe_error']}")
+    else:
+        st.success(f"Reachable. HTTP status: {diag.get('probe_status')} in {diag.get('probe_ms')} ms")
+
+# -------------------------
 # Preflight (optional)
 # -------------------------
 if user_url and skus:
     try:
         base_no_query_pf, params_base_pf = parse_user_url(user_url)
-        # simulate a single batch to estimate max query length
+        # simulate one batch to estimate max query length
         probe_batch = [pad_sku(s) for s in skus[: min(len(skus), int(chunk_size))]] if pad_to_six else skus[: min(len(skus), int(chunk_size))]
         qs = urlencode(build_params_with_skus(params_base_pf, probe_batch), doseq=True)
         with st.expander("Preflight", expanded=False):
             st.write(f"Planned requests: **{(len(skus) - 1) // int(chunk_size) + 1}**")
-            st.write(f"Largest single-batch querystring length (estimate): **~{len(qs)}** characters")
+            st.write(f"Estimated largest querystring length: **~{len(qs)}** characters")
     except Exception as e:
         st.info(f"Preflight skipped: {e}")
 
-# Run button
+# -------------------------
+# Run
+# -------------------------
 run_btn = st.button("Run fetch", type="primary", disabled=not (user_url and skus))
 
 if run_btn:
@@ -363,12 +452,23 @@ if run_btn:
             st.write(f"Prepared **{total_batches}** batch(es).")
 
         for i, batch in enumerate(batches, start=1):
+
             def _on_retry(attempt_i: int, code_or_exc: Any):
-                with stat:
-                    st.write(f"🔁 Retry {attempt_i} on batch {i}/{total_batches} (reason: {code_or_exc})")
+                # attempt_i == 0 == "starting request" message
+                if attempt_i == 0:
+                    try:
+                        # code_or_exc is "start(len_qs=NNN)"
+                        qs_len = str(code_or_exc).split("len_qs=")[-1].strip(")")
+                        with stat:
+                            st.write(f"🚀 Sending request for batch {i}/{total_batches} (QS length: {qs_len})")
+                    except Exception:
+                        with stat:
+                            st.write(f"🚀 Sending request for batch {i}/{total_batches}")
+                else:
+                    with stat:
+                        st.write(f"🔁 Retry {attempt_i} on batch {i}/{total_batches} (reason: {code_or_exc})")
 
             params = build_params_with_skus(params_base, batch)
-
             payload, attempts, duration = fetch_batch(
                 client, base_no_query, params, on_retry=_on_retry
             )
