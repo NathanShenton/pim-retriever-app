@@ -2,19 +2,21 @@
 # -*- coding: utf-8 -*-
 
 """
-PIM SKU Attribute Fetcher (Streamlit) — with Proxy Auto-Detect (PAC), progress, and diagnostics.
+PIM SKU Attribute Fetcher (Streamlit) — proxy-friendly
 
-Modes:
-- Auto (PAC/WPAD): detect and use system PAC like the browser does
-- Direct (ignore proxies): bypass all proxies (for full-tunnel VPN)
-- Env (HTTP(S)_PROXY): use proxy URLs from environment variables
+Adds connection modes:
+- Auto (PAC/WPAD)             -> detects system PAC (like browsers)
+- Env (HTTP(S)_PROXY)         -> uses HTTP_PROXY/HTTPS_PROXY env vars
+- Direct (ignore proxies)     -> bypass proxies (VPN full tunnel)
+- Explicit Proxy              -> paste proxy URL + optional username/password
+- Explicit Proxy (NTLM)       -> paste proxy URL; uses NTLM auth (Windows SSO)
 
 Features:
-- Paste URL up to attribute_codes=...; app appends &skus=... (repeated), batched
-- 6-digit zero-padding for numeric SKUs
-- Strong timeouts (no hangs), retries with backoff
+- Paste URL up to attribute_codes=...; app appends &skus=... (repeated)
+- 6-digit padding for numeric SKUs, safe batching
+- Strong timeouts + retries/backoff (no silent hangs)
 - Live progress, ETA, per-batch logs, toasts
-- Connectivity check (DNS, HTTP via chosen mode)
+- Connectivity check through the chosen mode
 """
 
 import io
@@ -30,12 +32,18 @@ import httpx
 import pandas as pd
 import streamlit as st
 
-# PAC support
+# Optional extras
 try:
     from pypac import get_pac
     HAVE_PYPAC = True
 except Exception:
     HAVE_PYPAC = False
+
+try:
+    from httpx_ntlm import HttpNtlmProxy
+    HAVE_NTLM = True
+except Exception:
+    HAVE_NTLM = False
 
 # =========================
 # Config
@@ -47,7 +55,6 @@ HTTPX_TIMEOUTS = httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=60.0)
 # =========================
 # Helpers
 # =========================
-
 def auth_headers() -> Dict[str, str]:
     token = os.getenv("PIM_TOKEN")
     headers = {"Accept": "application/json"}
@@ -60,6 +67,7 @@ def clean_skus(raw: str) -> List[str]:
         return []
     raw = raw.replace(";", "\n").replace(",", "\n").replace("\t", "\n")
     skus = [s.strip() for s in raw.splitlines() if s.strip()]
+    # de-dup keep order
     seen, out = set(), []
     for s in skus:
         if s not in seen:
@@ -151,83 +159,107 @@ def backoff_sleep(attempt: int, base: float = 0.5, cap: float = 20.0):
     delay = min(cap, base * (2 ** attempt)) + (0.1 * (attempt + 1))
     time.sleep(delay)
 
-# -------- Proxy handling (PAC / env / direct) --------
-
+# ---------------- Proxy helpers ----------------
 def _parse_pac_result(pac_str: str) -> Optional[str]:
-    """
-    Takes a PAC directive string like "PROXY proxy.mycorp:8080; DIRECT"
-    Returns a proxy URL string "http://proxy.mycorp:8080" or None for DIRECT.
-    """
+    # PAC like: "PROXY proxy.mycorp:8080; DIRECT"
     if not pac_str:
         return None
     parts = [p.strip() for p in pac_str.split(";") if p.strip()]
     for p in parts:
-        p_up = p.upper()
-        if p_up.startswith("PROXY "):
+        u = p.upper()
+        if u.startswith("PROXY "):
             hostport = p.split(" ", 1)[1].strip()
-            if not hostport.startswith("http://") and not hostport.startswith("https://"):
-                return f"http://{hostport}"
-            return hostport
-        if p_up.startswith("HTTPS "):  # rare, but handle
+            return hostport if hostport.startswith("http") else f"http://{hostport}"
+        if u.startswith("HTTPS "):
             hostport = p.split(" ", 1)[1].strip()
-            if not hostport.startswith("http"):
-                return f"https://{hostport}"
-            return hostport
-        if p_up.startswith("DIRECT"):
+            return hostport if hostport.startswith("http") else f"https://{hostport}"
+        if u.startswith("DIRECT"):
             return None
     return None
 
-def resolve_proxies_for_url(url: str, mode: str) -> Tuple[Dict[str, str], bool]:
+def resolve_proxies_for_url(url: str, mode: str, explicit_url: str, explicit_user: str, explicit_pass: str) -> Tuple[Dict[str, str], bool, Optional[httpx.Auth]]:
     """
-    Returns (proxies_dict, trust_env_flag).
-    - Auto (PAC/WPAD): use PAC if available; else honor env via trust_env=True
-    - Direct: no proxies, trust_env=False
-    - Env: proxies from HTTP(S)_PROXY, trust_env=False
+    Returns (proxies_dict, trust_env_flag, auth_for_proxy_or_none).
+    auth_for_proxy_or_none is only used for NTLM mode.
     """
+    # Direct
     if mode == "Direct (ignore proxies)":
-        return ({}, False)
+        return ({}, False, None)
 
+    # Env proxies
     if mode == "Env (HTTP(S)_PROXY)":
         proxies: Dict[str, str] = {}
         if os.getenv("HTTP_PROXY"):
             proxies["http://"] = os.getenv("HTTP_PROXY")
         if os.getenv("HTTPS_PROXY"):
             proxies["https://"] = os.getenv("HTTPS_PROXY")
-        return (proxies, False)
+        return (proxies, False, None)
 
-    # Auto (PAC/WPAD)
-    if HAVE_PYPAC:
-        try:
-            pac = get_pac()  # from env/wpad/registry if available
-            if pac:
-                u = urlparse(url)
-                pac_str = pac.find_proxy_for_url(url, u.hostname or "")
-                proxy_url = _parse_pac_result(pac_str)
-                if proxy_url:
-                    # Use same proxy for http and https; PAC typically returns one
-                    return ({"http://": proxy_url, "https://": proxy_url}, False)
-                else:
-                    # DIRECT
-                    return ({}, False)
-        except Exception:
-            pass
-    # Fallback: honor env automatically
-    return ({}, True)
+    # Explicit proxy with optional basic auth
+    if mode == "Explicit Proxy":
+        if not explicit_url:
+            raise ValueError("Proxy URL is required for 'Explicit Proxy' mode.")
+        # add basic auth creds into URL if provided
+        if explicit_user and explicit_pass and "@" not in explicit_url:
+            # http://user:pass@host:port
+            scheme, rest = explicit_url.split("://", 1) if "://" in explicit_url else ("http", explicit_url)
+            explicit_url = f"{scheme}://{explicit_user}:{explicit_pass}@{rest}"
+        proxies = {"http://": explicit_url, "https://": explicit_url}
+        return (proxies, False, None)
 
-def get_client_for_url(url: str, mode: str) -> httpx.Client:
+    # Explicit NTLM
+    if mode == "Explicit Proxy (NTLM)":
+        if not HAVE_NTLM:
+            raise RuntimeError("httpx-ntlm is not installed. pip install httpx-ntlm")
+        if not explicit_url:
+            raise ValueError("Proxy URL is required for 'Explicit Proxy (NTLM)' mode.")
+        # Username may be DOMAIN\\user or user@domain
+        ntlm_auth = HttpNtlmProxy(username=os.getenv("PROXY_USER") or "", password=os.getenv("PROXY_PASS") or "")
+        # If user typed creds, prefer those
+        if explicit_user or explicit_pass:
+            ntlm_auth = HttpNtlmProxy(username=explicit_user, password=explicit_pass)
+        proxies = {"http://": explicit_url, "https://": explicit_url}
+        return (proxies, False, ntlm_auth)
+
+    # Auto PAC/WPAD
+    if mode == "Auto (PAC/WPAD)":
+        if HAVE_PYPAC:
+            try:
+                pac = get_pac()
+                if pac:
+                    u = urlparse(url)
+                    pac_str = pac.find_proxy_for_url(url, u.hostname or "")
+                    proxy_url = _parse_pac_result(pac_str)
+                    if proxy_url:
+                        return ({"http://": proxy_url, "https://": proxy_url}, False, None)
+                    else:
+                        return ({}, False, None)  # DIRECT
+            except Exception:
+                pass
+        # Fallback to OS env
+        return ({}, True, None)
+
+    # Default: Auto env
+    return ({}, True, None)
+
+def get_client_for_url(url: str, mode: str, explicit_url: str, explicit_user: str, explicit_pass: str) -> httpx.Client:
     headers = auth_headers()
     verify: Any = True
-    if os.getenv("PIM_INSECURE_TLS") == "1":  # internal testing only
+    if os.getenv("PIM_INSECURE_TLS") == "1":
         verify = False
 
-    proxies, trust_env = resolve_proxies_for_url(url, mode)
+    proxies, trust_env, proxy_auth = resolve_proxies_for_url(url, mode, explicit_url, explicit_user, explicit_pass)
+
+    if proxy_auth is not None:
+        # NTLM proxy auth
+        return httpx.Client(timeout=HTTPX_TIMEOUTS, headers=headers, verify=verify, trust_env=trust_env, proxies=proxies, proxy_auth=proxy_auth)
+
     if proxies:
         return httpx.Client(timeout=HTTPX_TIMEOUTS, headers=headers, verify=verify, trust_env=trust_env, proxies=proxies)
-    else:
-        return httpx.Client(timeout=HTTPX_TIMEOUTS, headers=headers, verify=verify, trust_env=trust_env)
 
-# -------- HTTP --------
+    return httpx.Client(timeout=HTTPX_TIMEOUTS, headers=headers, verify=verify, trust_env=trust_env)
 
+# ---------------- HTTP core ----------------
 def fetch_batch(
     client: httpx.Client,
     base_url: str,
@@ -248,7 +280,7 @@ def fetch_batch(
     while True:
         try:
             resp = client.get(base_url, params=params, timeout=HTTPX_TIMEOUTS)
-            if resp.status_code in (429, 500, 502, 503, 504):
+            if resp.status_code in (429, 500, 502, 503, 504, 407):  # include 407 Proxy Auth Required
                 if attempt >= max_retries:
                     resp.raise_for_status()
                 if on_retry:
@@ -266,7 +298,7 @@ def fetch_batch(
             backoff_sleep(attempt)
             attempt += 1
 
-def diagnose_connectivity(user_url: str, pad_to_six_flag: bool, sample_sku: str, mode: str) -> Dict[str, Any]:
+def diagnose_connectivity(user_url: str, pad_to_six_flag: bool, sample_sku: str, mode: str, explicit_url: str, explicit_user: str, explicit_pass: str) -> Dict[str, Any]:
     results: Dict[str, Any] = {}
     try:
         u = urlparse(user_url)
@@ -280,16 +312,17 @@ def diagnose_connectivity(user_url: str, pad_to_six_flag: bool, sample_sku: str,
         results["dns_error"] = str(e)
         return results
 
-    # HTTP probe via chosen mode (TCP direct test is meaningless if proxy is required)
     try:
         base_no_query, params_base = parse_user_url(user_url)
         sku = pad_sku(sample_sku) if pad_to_six_flag else sample_sku
         params = build_params_with_skus(params_base, [sku])
-        with get_client_for_url(base_no_query, mode) as c:
+        with get_client_for_url(base_no_query, mode, explicit_url, explicit_user, explicit_pass) as c:
             t0 = time.time()
             r = c.get(base_no_query, params=params, timeout=HTTPX_TIMEOUTS)
             results["probe_status"] = r.status_code
             results["probe_ms"] = int((time.time() - t0) * 1000)
+            # include proxy info hint
+            results["using_proxies"] = True if getattr(c, "_proxies", None) else False
     except Exception as e:
         results["probe_error"] = str(e)
 
@@ -298,7 +331,6 @@ def diagnose_connectivity(user_url: str, pad_to_six_flag: bool, sample_sku: str,
 # =========================
 # Streamlit UI
 # =========================
-
 st.set_page_config(page_title="PIM SKU Attribute Fetcher", layout="wide")
 st.title("PIM SKU Attribute Fetcher")
 
@@ -307,16 +339,35 @@ with st.expander("Connection, Auth & Safety", expanded=False):
 - Paste a **full URL** up to and including `attribute_codes=...` (no `skus`).
 - The app appends `&skus=` as **repeated params** in batches (default 900).
 - **Auth**: set `PIM_TOKEN` as an environment variable if required by the API.
-- **Network**: use VPN or run on an on-net host. Host allow-list enforced.
-- **Proxy**: choose a connection mode below. If browser works but Python doesn’t, try **Auto (PAC/WPAD)**.
+- If browser works but the app times out, pick **Explicit Proxy** or **Explicit Proxy (NTLM)** below.
     """)
 
+# Connection mode
 connection_mode = st.radio(
     "Connection mode",
-    options=["Auto (PAC/WPAD)", "Direct (ignore proxies)", "Env (HTTP(S)_PROXY)"],
+    options=[
+        "Auto (PAC/WPAD)",
+        "Env (HTTP(S)_PROXY)",
+        "Direct (ignore proxies)",
+        "Explicit Proxy",
+        "Explicit Proxy (NTLM)"
+    ],
     index=0,
 )
 
+# Explicit proxy inputs
+proxy_url = ""
+proxy_user = ""
+proxy_pass = ""
+if connection_mode in ("Explicit Proxy", "Explicit Proxy (NTLM)"):
+    st.subheader("Proxy settings")
+    proxy_url = st.text_input("Proxy URL (e.g., http://proxy.mycorp:8080)", value="", placeholder="http://proxy.mycorp:8080")
+    proxy_user = st.text_input("Proxy username (optional; DOMAIN\\user or user@domain)", value="")
+    proxy_pass = st.text_input("Proxy password (optional)", value="", type="password")
+    if connection_mode == "Explicit Proxy (NTLM)" and not HAVE_NTLM:
+        st.error("httpx-ntlm not installed. Run: pip install httpx-ntlm")
+
+# Endpoint
 st.subheader("Endpoint (paste up to attribute_codes; no SKUs)")
 user_url = st.text_input(
     "Internal PIM URL",
@@ -328,12 +379,9 @@ show_url = st.checkbox("Temporarily reveal URL", value=False)
 if show_url and user_url:
     st.code(user_url)
 
+# SKUs
 st.subheader("SKUs")
-sku_text = st.text_area(
-    "Paste SKUs (newline/comma/semicolon/tab)",
-    height=160,
-    placeholder="064037\n123456\n42\nABC123",
-)
+sku_text = st.text_area("Paste SKUs (newline/comma/semicolon/tab)", height=160, placeholder="064037\n123456\n42\nABC123")
 skus = clean_skus(sku_text)
 st.caption(f"Total SKUs (before padding): {len(skus)}")
 
@@ -349,6 +397,7 @@ if uploaded:
         if not sku_col:
             sku_col = df_up.columns[0]
         file_skus = [str(x).strip() for x in df_up[sku_col].tolist() if str(x).strip()]
+        # merge and de-dup
         seen, merged = set(), []
         for s in skus + file_skus:
             if s not in seen:
@@ -359,6 +408,7 @@ if uploaded:
     except Exception as e:
         st.error(f"Failed to read CSV: {e}")
 
+# Options
 colA, colB, colC = st.columns([1, 1, 1])
 with colA:
     pad_to_six = st.toggle("Pad numeric SKUs to 6 chars (000042)", value=True)
@@ -367,26 +417,31 @@ with colB:
 with colC:
     save_raw = st.toggle("Enable raw JSONL download (responses)", value=False)
 
-# Diagnostics
-diag_cols = st.columns([1, 1])
-with diag_cols[0]:
-    diag_btn = st.button("Run connectivity check")
-with diag_cols[1]:
-    with st.expander("Environment (proxy/certs)", expanded=False):
-        st.code(
-            f"HTTP_PROXY={os.getenv('HTTP_PROXY')}\n"
-            f"HTTPS_PROXY={os.getenv('HTTPS_PROXY')}\n"
-            f"NO_PROXY={os.getenv('NO_PROXY')}\n"
-            f"SSL_CERT_FILE={os.getenv('SSL_CERT_FILE')}\n"
-            f"REQUESTS_CA_BUNDLE={os.getenv('REQUESTS_CA_BUNDLE')}\n"
-            f"PIM_INSECURE_TLS={os.getenv('PIM_INSECURE_TLS')}\n"
-            f"HAVE_PYPAC={HAVE_PYPAC}"
-        )
-        st.caption("Auto (PAC/WPAD) requires pypac; browsers usually use PAC automatically.")
+# Env view
+with st.expander("Environment (proxy/certs)", expanded=False):
+    st.code(
+        f"HTTP_PROXY={os.getenv('HTTP_PROXY')}\n"
+        f"HTTPS_PROXY={os.getenv('HTTPS_PROXY')}\n"
+        f"NO_PROXY={os.getenv('NO_PROXY')}\n"
+        f"SSL_CERT_FILE={os.getenv('SSL_CERT_FILE')}\n"
+        f"REQUESTS_CA_BUNDLE={os.getenv('REQUESTS_CA_BUNDLE')}\n"
+        f"PIM_INSECURE_TLS={os.getenv('PIM_INSECURE_TLS')}\n"
+        f"HAVE_PYPAC={HAVE_PYPAC}\n"
+        f"HAVE_NTLM={HAVE_NTLM}"
+    )
 
-if diag_btn and user_url:
+# Connectivity check
+if st.button("Run connectivity check") and user_url:
     with st.spinner("Diagnosing connectivity via selected mode..."):
-        diag = diagnose_connectivity(user_url, pad_to_six_flag=pad_to_six, sample_sku="42", mode=connection_mode)
+        diag = diagnose_connectivity(
+            user_url,
+            pad_to_six_flag=pad_to_six,
+            sample_sku="42",
+            mode=connection_mode,
+            explicit_url=proxy_url,
+            explicit_user=proxy_user,
+            explicit_pass=proxy_pass,
+        )
     st.write(diag)
     if "dns_error" in diag:
         st.error("DNS failed — check VPN / hostname.")
@@ -408,8 +463,7 @@ if user_url and skus:
         st.info(f"Preflight skipped: {e}")
 
 # Run
-run_btn = st.button("Run fetch", type="primary", disabled=not (user_url and skus))
-if run_btn:
+if st.button("Run fetch", type="primary", disabled=not (user_url and skus)):
     try:
         base_no_query, params_base = parse_user_url(user_url)
         if pad_to_six:
@@ -417,7 +471,7 @@ if run_btn:
         batches = list(chunked(skus, int(chunk_size)))
         total_batches = len(batches)
 
-        client = get_client_for_url(base_no_query, connection_mode)
+        client = get_client_for_url(base_no_query, connection_mode, proxy_url, proxy_user, proxy_pass)
 
         compiled_frames: List[pd.DataFrame] = []
         raw_lines: List[Dict[str, Any]] = []
