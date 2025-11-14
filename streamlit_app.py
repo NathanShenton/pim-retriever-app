@@ -54,10 +54,19 @@ def auth_headers() -> Dict[str, str]:
     return headers
 
 def get_client(timeout_s: int = 60) -> httpx.Client:
-    """Respect corporate proxies if set; keep TLS verification on."""
-    proxies = {"http://": os.getenv("HTTP_PROXY"), "https://": os.getenv("HTTPS_PROXY")}
-    proxies = {k: v for k, v in proxies.items() if v}
-    return httpx.Client(timeout=timeout_s, headers=auth_headers(), proxies=proxies or None)
+    """Create an httpx client; only pass 'proxies' if they’re explicitly set."""
+    proxies_env = {
+        "http://": os.getenv("HTTP_PROXY"),
+        "https://": os.getenv("HTTPS_PROXY"),
+    }
+    # keep only non-empty
+    proxies_env = {k: v for k, v in proxies_env.items() if v}
+
+    kwargs = dict(timeout=timeout_s, headers=auth_headers())
+    if proxies_env:
+        kwargs["proxies"] = proxies_env  # only include if present
+
+    return httpx.Client(**kwargs)
 
 def chunked(items: List[str], size: int) -> Iterable[List[str]]:
     for i in range(0, len(items), size):
