@@ -5,12 +5,18 @@
 Streamlit app: Paste an internal PIM URL up to & including attribute_codes=...,
 then the app appends &skus=... (repeated params) in safe batches and compiles results.
 
+Visibility:
+- Progress bar + running ETA
+- Status feed (success/retry per batch)
+- Live per-batch log table (rows, retries, time)
+- Preflight panel to preview request counts and max query length
+
 Security & Ops:
-- URL input is masked (password field) and never cached/logged by default.
-- Host allow-listed (default: *.hbi.systems); adjust ALLOWED_SUFFIXES if needed.
-- Bearer token is read from env var PIM_TOKEN (optional).
-- Caching of responses is disabled by default (toggleable).
-- Raw JSON download is off by default (toggleable).
+- URL input is masked (password field)
+- Host allow-listed (default: *.hbi.systems)
+- Bearer token read from env var PIM_TOKEN (optional)
+- Response caching disabled by default (toggleable)
+- Raw JSON download is opt-in
 
 Requirements:
     streamlit>=1.36
@@ -23,30 +29,26 @@ import io
 import json
 import os
 import time
-from pathlib import Path
+from time import perf_counter
 from typing import Any, Dict, Iterable, List, Tuple
+from urllib.parse import urlparse, parse_qsl, urlunparse, urlencode
 
 import httpx
 import pandas as pd
 import streamlit as st
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 # =========================
 # Config / Security
 # =========================
 
-# Only allow requests to hosts ending with these suffixes
-ALLOWED_SUFFIXES = (".hbi.systems",)
-
-# Reasonable safety default for max SKUs per request to avoid long URLs (414)
-DEFAULT_CHUNK_SIZE = 900
+ALLOWED_SUFFIXES = (".hbi.systems",)  # tighten/extend as needed
+DEFAULT_CHUNK_SIZE = 900              # keeps URLs under typical 414 limits
 
 # =========================
 # Helpers
 # =========================
 
 def auth_headers() -> Dict[str, str]:
-    """Attach Authorization header if PIM_TOKEN is set."""
     token = os.getenv("PIM_TOKEN")
     headers = {"Accept": "application/json"}
     if token:
@@ -54,17 +56,19 @@ def auth_headers() -> Dict[str, str]:
     return headers
 
 def get_client(timeout_s: int = 60) -> httpx.Client:
-    """Create an httpx client; only pass 'proxies' if they’re explicitly set."""
+    """
+    Create an httpx client; only pass 'proxies' if they’re explicitly set to
+    avoid version mismatches. TLS verification remains ON by default.
+    """
     proxies_env = {
         "http://": os.getenv("HTTP_PROXY"),
         "https://": os.getenv("HTTPS_PROXY"),
     }
-    # keep only non-empty
     proxies_env = {k: v for k, v in proxies_env.items() if v}
 
     kwargs = dict(timeout=timeout_s, headers=auth_headers())
     if proxies_env:
-        kwargs["proxies"] = proxies_env  # only include if present
+        kwargs["proxies"] = proxies_env  # httpx will honor NO_PROXY if set
 
     return httpx.Client(**kwargs)
 
@@ -88,10 +92,7 @@ def clean_skus(raw: str) -> List[str]:
     return out
 
 def pad_sku(s: str, width: int = 6) -> str:
-    """
-    Left-pad purely numeric SKUs to a fixed width with zeros; leave others untouched.
-    '42' -> '000042', 'ABC123' -> 'ABC123'
-    """
+    """Left-pad numeric SKUs to fixed width with zeros; leave alphanumerics unchanged."""
     return s.zfill(width) if s.isdigit() and len(s) < width else s
 
 def normalize_response(payload: Dict[str, Any]) -> pd.DataFrame:
@@ -136,7 +137,6 @@ def normalize_response(payload: Dict[str, Any]) -> pd.DataFrame:
                 return pivot
             return pd.json_normalize(data)
 
-        # unknown 'data' list
         return pd.json_normalize(data)
 
     # case 3: map of skus -> attr dicts
@@ -189,15 +189,15 @@ def parse_user_url(user_url: str) -> Tuple[str, Dict[str, List[str]]]:
 
 def build_params_with_skus(params_base: Dict[str, List[str]], skus: List[str]) -> Dict[str, List[str]]:
     """
-    Clone the base params and append SKUs as repeated keys (&skus=A&skus=B...).
-    httpx will automatically encode list values as repeated query params.
+    Clone base params and append SKUs as repeated keys (&skus=A&skus=B...).
+    httpx will encode list values as repeated query params when doseq=True internally.
     """
     params = {k: list(v) for k, v in params_base.items()}
     params["skus"] = skus
     return params
 
 def backoff_sleep(attempt: int, base: float = 0.5, cap: float = 20.0):
-    """Exponential backoff with jitter-ish increment."""
+    """Exponential backoff with a small additive nudge."""
     delay = min(cap, base * (2 ** attempt)) + (0.1 * (attempt + 1))
     time.sleep(delay)
 
@@ -205,23 +205,34 @@ def fetch_batch(
     client: httpx.Client,
     base_url: str,
     params: Dict[str, List[str]],
-    max_retries: int = 6
-) -> Dict[str, Any]:
+    max_retries: int = 6,
+    on_retry: callable | None = None,   # (attempt_index, http_status_or_exc) -> None
+) -> Tuple[Dict[str, Any], int, float]:
+    """
+    Returns: (payload, attempts (retries used), duration_seconds)
+    - attempts = number of retry attempts actually taken (0 if first try succeeded)
+    - duration_seconds = end-to-end time for this batch
+    """
     attempt = 0
+    start = perf_counter()
     while True:
         try:
             resp = client.get(base_url, params=params)
             if resp.status_code in (429, 500, 502, 503, 504):
                 if attempt >= max_retries:
                     resp.raise_for_status()
+                if on_retry:
+                    on_retry(attempt + 1, resp.status_code)
                 backoff_sleep(attempt)
                 attempt += 1
                 continue
             resp.raise_for_status()
-            return resp.json()
-        except httpx.RequestError:
+            return resp.json(), attempt, perf_counter() - start
+        except httpx.RequestError as e:
             if attempt >= max_retries:
                 raise
+            if on_retry:
+                on_retry(attempt + 1, type(e).__name__)
             backoff_sleep(attempt)
             attempt += 1
 
@@ -249,7 +260,7 @@ user_url = st.text_input(
     "Internal PIM URL (kept in memory only)",
     value="",
     placeholder="https://.../v4/description/skus?attribute_codes=returnable",
-    type="password",   # hides on screen
+    type="password",
 )
 show_url = st.checkbox("Temporarily reveal URL", value=False)
 if show_url and user_url:
@@ -265,16 +276,13 @@ sku_text = st.text_area(
 
 # Options
 colA, colB, colC = st.columns([1, 1, 1])
-
 with colA:
     pad_to_six = st.toggle("Pad numeric SKUs to 6 chars (000042)", value=True)
-
 with colB:
     chunk_size = st.number_input(
         "Batch size (max SKUs per request)",
         value=DEFAULT_CHUNK_SIZE, min_value=50, max_value=2000, step=50
     )
-
 with colC:
     disable_cache = st.toggle("Disable response caching (recommended)", value=True)
 
@@ -284,7 +292,7 @@ save_raw = st.toggle("Enable raw JSONL download (responses)", value=False)
 skus = clean_skus(sku_text)
 st.caption(f"Total SKUs (before padding): {len(skus)}")
 
-# File upload (optional)
+# Optional CSV upload
 uploaded = st.file_uploader("...or upload a CSV with a 'sku' column", type=["csv"])
 if uploaded:
     try:
@@ -309,6 +317,21 @@ if uploaded:
     except Exception as e:
         st.error(f"Failed to read CSV: {e}")
 
+# -------------------------
+# Preflight (optional)
+# -------------------------
+if user_url and skus:
+    try:
+        base_no_query_pf, params_base_pf = parse_user_url(user_url)
+        # simulate a single batch to estimate max query length
+        probe_batch = [pad_sku(s) for s in skus[: min(len(skus), int(chunk_size))]] if pad_to_six else skus[: min(len(skus), int(chunk_size))]
+        qs = urlencode(build_params_with_skus(params_base_pf, probe_batch), doseq=True)
+        with st.expander("Preflight", expanded=False):
+            st.write(f"Planned requests: **{(len(skus) - 1) // int(chunk_size) + 1}**")
+            st.write(f"Largest single-batch querystring length (estimate): **~{len(qs)}** characters")
+    except Exception as e:
+        st.info(f"Preflight skipped: {e}")
+
 # Run button
 run_btn = st.button("Run fetch", type="primary", disabled=not (user_url and skus))
 
@@ -321,38 +344,93 @@ if run_btn:
             skus = [pad_sku(s) for s in skus]
 
         batches = list(chunked(skus, int(chunk_size)))
+        total_batches = len(batches)
         client = get_client()
 
         compiled_frames: List[pd.DataFrame] = []
         raw_lines: List[Dict[str, Any]] = []
 
-        with st.spinner(f"Calling API in {len(batches)} batch(es)..."):
-            for i, batch in enumerate(batches, start=1):
-                params = build_params_with_skus(params_base, batch)  # -> repeated &skus=
-                payload = fetch_batch(client, base_no_query, params)
-                if save_raw and not disable_cache:
-                    raw_lines.append({
-                        "batch_index": i, "batch_size": len(batch),
-                        "skus": batch, "response": payload
-                    })
+        # --- Live visibility UI ---
+        prog = st.progress(0.0)
+        stat = st.status("Starting…", expanded=True)
+        log_ph = st.empty()
+        kpi1, kpi2, kpi3 = st.columns(3)
 
-                df = normalize_response(payload)
-                if not df.empty:
-                    cols = list(df.columns)
-                    if "sku" in cols:
-                        df = df[["sku"] + [c for c in cols if c != "sku"]]
-                    compiled_frames.append(df)
+        log_rows: List[Dict[str, Any]] = []
+        total_elapsed = 0.0
+        total_retries = 0
+
+        with stat:
+            st.write(f"Prepared **{total_batches}** batch(es).")
+
+        for i, batch in enumerate(batches, start=1):
+            def _on_retry(attempt_i: int, code_or_exc: Any):
+                with stat:
+                    st.write(f"🔁 Retry {attempt_i} on batch {i}/{total_batches} (reason: {code_or_exc})")
+
+            params = build_params_with_skus(params_base, batch)
+
+            payload, attempts, duration = fetch_batch(
+                client, base_no_query, params, on_retry=_on_retry
+            )
+            total_elapsed += duration
+            total_retries += attempts
+
+            df = normalize_response(payload)
+            rows = 0
+            if not df.empty:
+                cols = list(df.columns)
+                if "sku" in cols:
+                    df = df[["sku"] + [c for c in cols if c != "sku"]]
+                compiled_frames.append(df)
+                rows = len(df)
+
+            if save_raw and not disable_cache:
+                raw_lines.append({
+                    "batch_index": i, "batch_size": len(batch),
+                    "skus": batch, "response": payload
+                })
+
+            # Update progress + ETA + KPIs
+            prog.progress(i / total_batches)
+            avg = (total_elapsed / i) if i else 0.0
+            remaining = total_batches - i
+            eta = remaining * avg
+
+            with stat:
+                st.write(f"✅ Batch {i}/{total_batches}: {len(batch)} SKUs | {rows} rows | {duration:.2f}s | retries: {attempts}")
+
+            # live log table
+            log_rows.append({
+                "batch": i,
+                "batch_size": len(batch),
+                "rows": rows,
+                "retries": attempts,
+                "duration_s": round(duration, 3),
+                "avg_s": round(avg, 3),
+                "eta_s": round(eta, 1),
+            })
+            log_df = pd.DataFrame(log_rows)
+            log_ph.dataframe(log_df, use_container_width=True, height=260)
+
+            kpi1.metric("Batches done", f"{i}/{total_batches}")
+            kpi2.metric("Total retries", f"{total_retries}")
+            kpi3.metric("ETA (s)", f"{int(eta)}")
+
+            st.toast(f"Batch {i}/{total_batches} done in {duration:.2f}s (retries: {attempts})")
 
         client.close()
 
+        # Compile + downloads
         if not compiled_frames:
+            stat.update(label="Finished (no rows parsed).", state="warning", expanded=False)
             st.warning("No rows parsed from responses. Verify URL/attribute_codes and try again.")
         else:
             compiled = pd.concat(compiled_frames, ignore_index=True).drop_duplicates()
-            st.success(f"Got {len(compiled)} rows.")
+            stat.update(label="Finished successfully.", state="complete", expanded=False)
+            st.success(f"Got {len(compiled)} rows total.")
             st.dataframe(compiled, use_container_width=True)
 
-            # Downloads
             st.download_button(
                 "Download compiled CSV",
                 data=compiled.to_csv(index=False).encode("utf-8"),
@@ -360,7 +438,6 @@ if run_btn:
                 mime="text/csv",
             )
 
-            # Parquet (optional)
             try:
                 buf = io.BytesIO()
                 compiled.to_parquet(buf, index=False)
@@ -373,7 +450,6 @@ if run_btn:
             except Exception:
                 st.info("Parquet download requires pyarrow. Add it to requirements if needed.")
 
-            # Raw JSONL (optional)
             if save_raw and raw_lines:
                 st.download_button(
                     "Download raw JSONL (per-batch)",
