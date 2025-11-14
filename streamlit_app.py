@@ -37,6 +37,9 @@ import httpx
 import pandas as pd
 import streamlit as st
 
+from typing import Any, Dict, Iterable, List, Tuple, Callable, Optional
+
+
 # =========================
 # Config / Security
 # =========================
@@ -206,13 +209,8 @@ def fetch_batch(
     base_url: str,
     params: Dict[str, List[str]],
     max_retries: int = 6,
-    on_retry: callable | None = None,   # (attempt_index, http_status_or_exc) -> None
+    on_retry: Optional[Callable[[int, Any], None]] = None,  # (attempt_index, http_status_or_exc) -> None
 ) -> Tuple[Dict[str, Any], int, float]:
-    """
-    Returns: (payload, attempts (retries used), duration_seconds)
-    - attempts = number of retry attempts actually taken (0 if first try succeeded)
-    - duration_seconds = end-to-end time for this batch
-    """
     attempt = 0
     start = perf_counter()
     while True:
@@ -235,6 +233,7 @@ def fetch_batch(
                 on_retry(attempt + 1, type(e).__name__)
             backoff_sleep(attempt)
             attempt += 1
+
 
 # =========================
 # Streamlit UI
